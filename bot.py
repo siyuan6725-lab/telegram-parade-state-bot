@@ -8,192 +8,116 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    PollAnswerHandler,
 )
 
-# Load environment variables from a local .env file (if present)
 load_dotenv()
 
-# Configuration — Reads secrets securely from environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID_ENV = os.getenv("CHAT_ID")
-ADMIN_ID_ENV = os.getenv("ADMIN_ID")
-
-# Ensure required credentials are present
-if not BOT_TOKEN or not CHAT_ID_ENV or not ADMIN_ID_ENV:
-    raise ValueError(
-        "Missing required environment variables! Ensure BOT_TOKEN, CHAT_ID, and ADMIN_ID are set."
-    )
-
-CHAT_ID = int(CHAT_ID_ENV)
-ADMIN_ID = int(ADMIN_ID_ENV)
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 TIMEZONE = pytz.timezone(os.getenv("TIMEZONE", "Asia/Singapore"))
 DB_FILE = os.getenv("DB_FILE", "bot_state.db")
 
 POLL_OPTIONS = [
-    "Camp AM",
-    "Camp PM",
-    "OOC AM",
-    "OOC PM",
-    "LL AM",
-    "LL PM",
-    "MC",
-    "MA AM",
-    "MA PM",
-    "Others",
+    "Camp AM", "Camp PM", "OOC AM", "OOC PM",
+    "LL AM", "LL PM", "MC", "MA AM"
 ]
-
 
 # Database Setup
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS state (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-            """
-        )
+        cursor.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS members (user_id INTEGER PRIMARY KEY, username TEXT)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS todays_votes (user_id INTEGER PRIMARY KEY)")
         conn.commit()
 
-
-def set_poll_id(message_id: int):
+def save_member(user_id: int, username: str):
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
-            ("latest_poll_message_id", str(message_id)),
-        )
+        cursor.execute("INSERT OR REPLACE INTO members (user_id, username) VALUES (?, ?)", (user_id, username or "Unknown"))
         conn.commit()
 
-
-def get_poll_id() -> int | None:
+def record_vote(user_id: int):
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT value FROM state WHERE key = 'latest_poll_message_id'"
-        )
-        row = cursor.fetchone()
-        return int(row[0]) if row and row[0] else None
+        cursor.execute("INSERT OR REPLACE INTO todays_votes (user_id) VALUES (?)", (user_id,))
+        conn.commit()
 
+def clear_daily_votes():
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM todays_votes")
+        conn.commit()
 
-# Error Handling
-async def send_error_alert(
-    context: ContextTypes.DEFAULT_TYPE, task_name: str, error: Exception
-):
-    error_msg = (
-        f"⚠️ **Bot Alert**: Failure in `{task_name}`\n\n"
-        f"**Error Details:**\n`{str(error)}`"
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID, text=error_msg, parse_mode="Markdown"
-        )
-    except Exception as e:
-        print(f"Failed to send error alert to admin: {e}")
+def get_non_voters() -> list[int]:
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT m.user_id FROM members m 
+            LEFT JOIN todays_votes v ON m.user_id = v.user_id 
+            WHERE v.user_id IS NULL
+        """)
+        return [row[0] for row in cursor.fetchall()]
 
+# Handlers
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_member(user.id, user.username)
+    await update.message.reply_text(f"👋 Hi {user.first_name}! You are registered for Parade State reminders.")
 
-# Core Bot Actions
-async def execute_send_poll(context: ContextTypes.DEFAULT_TYPE):
+async def track_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tracks when a user casts or updates a vote."""
+    answer = update.poll_answer
+    record_vote(answer.user.id)
+
+# Core Scheduled Tasks
+async def auto_send_morning_poll(context: ContextTypes.DEFAULT_TYPE):
+    clear_daily_votes()
     tomorrow = datetime.datetime.now(TIMEZONE) + datetime.timedelta(days=1)
     date_str = tomorrow.strftime("%d/%m/%y")
-    question = f"Parade State for {date_str}"
-
-    message = await context.bot.send_poll(
+    
+    await context.bot.send_poll(
         chat_id=CHAT_ID,
-        question=question,
+        question=f"Parade State for {date_str}",
         options=POLL_OPTIONS,
         is_anonymous=False,
-        allows_multiple_answers=False,
+        allows_multiple_answers=True,
     )
-    set_poll_id(message.message_id)
 
+async def auto_send_dm_to_non_voters(context: ContextTypes.DEFAULT_TYPE):
+    non_voter_ids = get_non_voters()
+    reminder_text = "📢 **Parade State Reminder**: You haven't submitted your vote for today's poll yet. Please vote in the group chat!"
 
-async def execute_send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    reminder_text = (
-        "📢 **Reminder**: Please remember to submit your Parade State for today if you haven't already!"
-    )
-    poll_id = get_poll_id()
-
-    if poll_id:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=reminder_text,
-            reply_to_message_id=poll_id,
-            parse_mode="Markdown",
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=CHAT_ID, text=reminder_text, parse_mode="Markdown"
-        )
-
-
-# Scheduled Tasks
-async def send_night_poll(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await execute_send_poll(context)
-    except Exception as e:
-        await send_error_alert(context, "send_night_poll", e)
-
-
-async def send_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await execute_send_reminder(context)
-    except Exception as e:
-        await send_error_alert(context, "send_morning_reminder", e)
-
-
-# Manual Commands
-async def manual_poll_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    try:
-        await execute_send_poll(context)
-        await update.message.reply_text("✅ Poll created successfully.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to create poll: {e}")
-
-
-async def manual_reminder_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    try:
-        await execute_send_reminder(context)
-        await update.message.reply_text("✅ Reminder sent successfully.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to send reminder: {e}")
-
+    for user_id in non_voter_ids:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=reminder_text, parse_mode="Markdown")
+        except Exception as e:
+            print(f"Could not send DM to {user_id}: {e}")
 
 def main():
     init_db()
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     job_queue = app.job_queue
 
-    # Register Manual Commands
-    app.add_handler(CommandHandler("pollnow", manual_poll_command))
-    app.add_handler(CommandHandler("remindnow", manual_reminder_command))
+    # Register Handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(PollAnswerHandler(track_poll_answer))
 
-    # Daily Schedule (8:00 PM Poll, 8:00 AM Reminder)
+    # Daily Automatic Schedule (Asia/Singapore)
+    # 1. Automatic Poll creation at 7:00 AM
     job_queue.run_daily(
-        send_night_poll,
-        time=datetime.time(hour=20, minute=0, second=0, tzinfo=TIMEZONE),
+        auto_send_morning_poll,
+        time=datetime.time(hour=7, minute=0, second=0, tzinfo=TIMEZONE)
     )
+    # 2. Direct message reminders to non-voters at 7:01 AM
     job_queue.run_daily(
-        send_morning_reminder,
-        time=datetime.time(hour=8, minute=0, second=0, tzinfo=TIMEZONE),
+        auto_send_dm_to_non_voters,
+        time=datetime.time(hour=7, minute=1, second=0, tzinfo=TIMEZONE)
     )
 
-    print("Bot is up and running safely!")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
